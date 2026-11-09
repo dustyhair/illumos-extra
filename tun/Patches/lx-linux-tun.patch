@@ -1,0 +1,486 @@
+--- a/if_tun.h
++++ b/if_tun.h
+@@ -4,6 +4,7 @@
+  *  Multithreaded STREAMS tun pseudo device driver.
+  *
+  *  Copyright (C) 1999-2000 Maxim Krasnyansky <max_mk@yahoo.com>
++ *  Copyright 2026 Jonathan Wagner.
+  *  
+  *  This program is free software; you can redistribute it and/or modify
+  *  it under the terms of the GNU General Public License as published by
+@@ -28,6 +29,11 @@
+ #define	_SYS_IF_TUN_H
+ 
+ #ifdef _KERNEL
++#include <sys/cred.h>
++#include <sys/sunldi.h>
++#include <sys/zone.h>
++#include <net/if.h>
++
+ /* Uncomment to enable debuging */
+ //#define TUN_DEBUG 1
+ 
+@@ -42,6 +48,13 @@
+   unsigned int id;    		/* Iface number		*/
+   queue_t *rq;			/* Control Stream RQ    */
+   struct tunstr * p_str; 	/* Protocol Streams 	*/
++#ifdef TUNTAP_TUN
++  ldi_handle_t lx_mux;		/* LX IP multiplexor handle */
++  int lx_muxid;			/* LX IP persistent link id */
++  cred_t *lx_cred;		/* Credential that owns the link */
++  zoneid_t lx_zoneid;		/* LX zone that owns the interface */
++  char lx_name[LIFNAMSIZ];	/* Linux-visible interface name */
++#endif
+ #ifdef TUNTAP_TAP
+     struct ether_addr  etheraddr;  /* Ethernet Address */
+ #endif    
+@@ -92,4 +105,19 @@
+ #define TUNNEWPPA	(('T'<<16) | 0x0001)
+ #define TUNSETPPA	(('T'<<16) | 0x0002)
+ 
++/* Private kernel ioctls used by the SmartOS LX Linux-TUN translator. */
++#define TUNLXNEWIFF	(('T'<<16) | 0x0003)
++#define TUNLXPLUMBIFF	(('T'<<16) | 0x0004)
++#define TUNLXGETIFF	(('T'<<16) | 0x0005)
++
++#define TUNLX_IFF_TUN	0x0001
++#define TUNLX_IFF_NO_PI	0x1000
++
++struct tun_lx_ifreq {
++  char name[16];
++  uint16_t flags;
++  int32_t ppa;
++  int32_t zoneid;
++};
++
+ #endif	/* _SYS_IF_TUN_H */
+--- a/tun.c
++++ b/tun.c
+@@ -4,6 +4,7 @@
+  *  Multithreaded STREAMS tun pseudo device driver.
+  *
+  *  Copyright (C) 1999-2000 Maxim Krasnyansky <max_mk@yahoo.com>
++ *  Copyright 2026 Jonathan Wagner.
+  *
+  *  This program is free software; you can redistribute it and/or modify
+  *  it under the terms of the GNU General Public License as published by
+@@ -35,6 +36,12 @@
+ #include <sys/errno.h>
+ #include <sys/strsun.h>
+ #include <sys/byteorder.h>
++#include <sys/file.h>
++#include <sys/policy.h>
++#include <sys/sockio.h>
++#include <sys/sunldi.h>
++#include <sys/taskq.h>
++#include <sys/zone.h>
+ 
+ #include <sys/ddi.h>
+ #include <sys/sunddi.h>
+@@ -59,6 +66,10 @@
+ static	int  tunwsrv(queue_t *wq);
+ 
+ static  void tun_frame(queue_t *wq, mblk_t *mpi, int q);
++#ifdef TUNTAP_TUN
++static void tun_lx_unplumb(struct tunppa *);
++static void tun_lx_plumb_defer(queue_t *, mblk_t *);
++#endif
+ #ifdef TUNTAP_TAP
+ static mblk_t *tun_eth_hdr(mblk_t *mp, int type, struct ether_addr dest_addr, struct ether_addr src_addr);
+ static int tun_frame_is_eligible(struct ether_header *etherhdr, struct tunstr *str);
+@@ -164,19 +175,41 @@
+ /* List of active driver Streams */
+ static struct tunstr *tun_str;
+ 
++#ifdef TUNTAP_TUN
++static ldi_ident_t tun_ldi;
++#endif
++
+ int _init(void)
+ {
++  int error;
++
+   cmn_err(CE_CONT, "!Universal TUN/TAP device driver ver %s "
+ 		   "(C) 1999-2000 Maxim Krasnyansky\n", TUN_VER);
+ 
+   DBG(CE_CONT,"tun: _init\n");
+-  return mod_install(&modlinkage);
++  if ((error = mod_install(&modlinkage)) != 0)
++     return error;
++#ifdef TUNTAP_TUN
++  if ((error = ldi_ident_from_mod(&modlinkage, &tun_ldi)) != 0) {
++     (void) mod_remove(&modlinkage);
++     return error;
++  }
++#endif
++  return 0;
+ }
+ 
+ int _fini(void)
+ {
++  int error;
++
+   DBG(CE_CONT,"tun: _fini\n");
+-  return mod_remove(&modlinkage);
++  if ((error = mod_remove(&modlinkage)) != 0)
++     return error;
++#ifdef TUNTAP_TUN
++  ldi_ident_release(tun_ldi);
++  tun_ldi = NULL;
++#endif
++  return 0;
+ }
+ 
+ int _info(struct modinfo *modinfop)
+@@ -309,6 +342,10 @@
+      if( str->flags & TUN_CONTROL ){
+   	DBG(CE_CONT,"tun: closing control str %p PPA %p\n", str, ppa);
+ 
++#ifdef TUNTAP_TUN
++	tun_lx_unplumb(ppa);
++#endif
++
+ 	/* Unlink all protocol Streams from the PPA */
+ 	for(tmp = ppa->p_str; tmp; tmp = tmp->p_next){
+ 	   flushq(WR(tmp->rq), FLUSHDATA);
+@@ -352,6 +389,207 @@
+   qreply(wq, mp);
+ }
+ 
++#ifdef TUNTAP_TUN
++static void tuniocack_data(queue_t *wq, mblk_t *mp, int ret)
++{
++  struct iocblk *ioc = (struct iocblk *)mp->b_rptr;
++
++  mp->b_datap->db_type = M_IOCACK;
++  ioc->ioc_count = sizeof(struct tun_lx_ifreq);
++  ioc->ioc_error = 0;
++  ioc->ioc_rval = ret;
++  qreply(wq, mp);
++}
++
++static int tun_lx_stream_ioctl(ldi_handle_t handle, int command, void *arg,
++                               size_t size, cred_t *cred)
++{
++  struct strioctl ioc;
++  int rval;
++
++  ioc.ic_cmd = command;
++  ioc.ic_timout = 15;
++  ioc.ic_len = size;
++  ioc.ic_dp = arg;
++  return ldi_ioctl(handle, I_STR, (intptr_t)&ioc, FKIOCTL, cred, &rval);
++}
++
++struct tun_lx_cleanup {
++  ldi_handle_t mux;
++  int muxid;
++  cred_t *cred;
++};
++
++struct tun_lx_plumb_work {
++  queue_t *wq;
++  mblk_t *mp;
++};
++
++static void tun_lx_cleanup_task(void *arg)
++{
++  struct tun_lx_cleanup *cleanup = arg;
++  int rval;
++  int flags = FREAD | FWRITE | FNOCTTY | FKIOCTL;
++
++  if (cleanup->muxid != -1)
++     (void) ldi_ioctl(cleanup->mux, I_PUNLINK, cleanup->muxid, flags,
++                      cleanup->cred, &rval);
++  (void) ldi_close(cleanup->mux, FREAD | FWRITE, cleanup->cred);
++  crfree(cleanup->cred);
++  kmem_free(cleanup, sizeof(*cleanup));
++}
++
++static void tun_lx_unplumb(struct tunppa *ppa)
++{
++  struct tun_lx_cleanup *cleanup;
++  taskqid_t id;
++
++  if (ppa->lx_mux == NULL)
++     return;
++  cleanup = kmem_alloc(sizeof(*cleanup), KM_SLEEP);
++  cleanup->mux = ppa->lx_mux;
++  cleanup->muxid = ppa->lx_muxid;
++  cleanup->cred = ppa->lx_cred;
++  ppa->lx_mux = NULL;
++  ppa->lx_muxid = -1;
++  ppa->lx_cred = NULL;
++  ppa->lx_name[0] = '\0';
++  id = taskq_dispatch(system_taskq, tun_lx_cleanup_task, cleanup, TQ_SLEEP);
++  VERIFY(id != TASKQID_INVALID);
++}
++
++static int tun_lx_plumb(struct tunstr *str, struct tun_lx_ifreq *req,
++                        cred_t *cred)
++{
++  struct tunppa *ppa = str->ppa;
++  ldi_handle_t lower = NULL;
++  ldi_handle_t mux = NULL;
++  struct lifreq lifr;
++  struct ifreq ifr;
++  int error;
++  int muxid = -1;
++  int rval;
++  int flags = FREAD | FWRITE | FNOCTTY | FKIOCTL;
++  zone_t *zone;
++  cred_t *netcred;
++
++  if (secpolicy_net_config(cred, B_FALSE) != 0)
++     return EPERM;
++  if (ppa == NULL || (str->flags & TUN_CONTROL) == 0 ||
++      ppa->id != req->ppa)
++     return EINVAL;
++  if (ppa->lx_mux != NULL)
++     return EBUSY;
++  if (req->zoneid == GLOBAL_ZONEID ||
++      (zone = zone_find_by_id(req->zoneid)) == NULL)
++     return EINVAL;
++  netcred = zone->zone_kcred;
++  crhold(netcred);
++  zone_rele(zone);
++
++  error = ldi_open_by_name("/dev/tun", FREAD | FWRITE, netcred, &lower,
++                           tun_ldi);
++  if (error != 0)
++     goto out;
++  error = ldi_ioctl(lower, I_PUSH, (intptr_t)"ip", FKIOCTL, netcred,
++                    &rval);
++  if (error != 0)
++     goto out;
++
++  bzero(&lifr, sizeof(lifr));
++  (void) strlcpy(lifr.lifr_name, req->name, sizeof(lifr.lifr_name));
++  lifr.lifr_ppa = ppa->id;
++  lifr.lifr_flags = IFF_IPV4 | IFF_NOARP;
++  error = tun_lx_stream_ioctl(lower, SIOCSLIFNAME, &lifr, sizeof(lifr),
++                              netcred);
++  if (error != 0)
++     goto out;
++
++  error = ldi_open_by_name("/dev/udp", FREAD | FWRITE, netcred, &mux,
++                           tun_ldi);
++  if (error != 0)
++     goto out;
++  error = ldi_ioctl(mux, I_PLINK, (intptr_t)lower, flags, netcred, &muxid);
++  if (error != 0)
++     goto out;
++
++  bzero(&ifr, sizeof(ifr));
++  (void) strlcpy(ifr.ifr_name, req->name, sizeof(ifr.ifr_name));
++  ifr.ifr_ip_muxid = muxid;
++  ifr.ifr_arp_muxid = 0;
++  error = ldi_ioctl(mux, SIOCSIFMUXID, (intptr_t)&ifr, FKIOCTL, netcred,
++                    &rval);
++  if (error != 0)
++     goto out;
++
++  ppa->lx_mux = mux;
++  ppa->lx_muxid = muxid;
++  ppa->lx_cred = netcred;
++  ppa->lx_zoneid = req->zoneid;
++  (void) strlcpy(ppa->lx_name, req->name, sizeof(ppa->lx_name));
++  mux = NULL;
++  muxid = -1;
++  netcred = NULL;
++
++out:
++  if (error != 0 && mux != NULL && muxid != -1)
++     (void) ldi_ioctl(mux, I_PUNLINK, muxid, flags, netcred, &rval);
++  if (lower != NULL)
++     (void) ldi_close(lower, FREAD | FWRITE, netcred);
++  if (mux != NULL)
++     (void) ldi_close(mux, FREAD | FWRITE, netcred);
++  if (netcred != NULL)
++     crfree(netcred);
++  return error;
++}
++
++static void tun_lx_plumb_ioctl(queue_t *wq, mblk_t *mp)
++{
++  struct iocblk *ioc = (struct iocblk *)mp->b_rptr;
++  struct tunstr *str = (struct tunstr *)wq->q_ptr;
++  struct tun_lx_ifreq *req;
++  int error;
++
++  if (mp->b_cont == NULL || MBLKL(mp->b_cont) < sizeof(*req)) {
++     tuniocack(wq, mp, M_IOCNAK, 0, EINVAL);
++     return;
++  }
++  req = (struct tun_lx_ifreq *)mp->b_cont->b_rptr;
++  error = tun_lx_plumb(str, req, ioc->ioc_cr);
++  if (error != 0) {
++     tuniocack(wq, mp, M_IOCNAK, 0, error);
++     return;
++  }
++  tuniocack_data(wq, mp, 0);
++}
++
++static void tun_lx_plumb_task(void *arg)
++{
++  struct tun_lx_plumb_work *work = arg;
++
++  tun_lx_plumb_ioctl(work->wq, work->mp);
++  kmem_free(work, sizeof(*work));
++}
++
++static void tun_lx_plumb_defer(queue_t *wq, mblk_t *mp)
++{
++  struct tun_lx_plumb_work *work;
++
++  work = kmem_alloc(sizeof(*work), KM_NOSLEEP);
++  if (work == NULL) {
++     tuniocack(wq, mp, M_IOCNAK, 0, ENOMEM);
++     return;
++  }
++  work->wq = wq;
++  work->mp = mp;
++  if (taskq_dispatch(system_taskq, tun_lx_plumb_task, work,
++                     TQ_NOSLEEP) == TASKQID_INVALID) {
++     kmem_free(work, sizeof(*work));
++     tuniocack(wq, mp, M_IOCNAK, 0, EAGAIN);
++  }
++}
++#endif
++
+ /* Allocate new PPA */
+ struct tunppa * tun_alloc_ppa(int id)
+ {
+@@ -369,6 +607,9 @@
+   }
+   ppa = (struct tunppa *)kmem_zalloc(sizeof(struct tunppa), KM_SLEEP);
+   ppa->id = id;
++#ifdef TUNTAP_TUN
++  ppa->lx_muxid = -1;
++#endif
+   tun_ppa[id] = ppa;
+ 
+ #ifdef TUNTAP_TAP
+@@ -379,6 +620,25 @@
+   return ppa;
+ }
+ 
++#ifdef TUNTAP_TUN
++static int tun_lx_requested_ppa(const char *name)
++{
++  int id = 0;
++  const char *p;
++
++  if (strncmp(name, "tun", 3) != 0 || name[3] == '\0')
++     return -1;
++  for (p = name + 3; *p != '\0'; p++) {
++     if (*p < '0' || *p > '9')
++        return -1;
++     id = id * 10 + (*p - '0');
++     if (id >= TUNMAXPPA)
++        return -1;
++  }
++  return id;
++}
++#endif
++
+ /* Handle IOCTLs */
+ static void tun_ioctl(queue_t *wq, mblk_t *mp)
+ {
+@@ -458,6 +718,84 @@
+   	DBG(CE_CONT,"tun: str %p attached to PPA %d \n", str, p);
+         break;
+ 
++#ifdef TUNTAP_TUN
++     case TUNLXNEWIFF: {
++	struct tun_lx_ifreq *req;
++
++	if (secpolicy_net_config(ioc->ioc_cr, B_FALSE) != 0) {
++           tuniocack(wq, mp, M_IOCNAK, 0, EPERM);
++	   return;
++	}
++	if (mp->b_cont == NULL ||
++	    MBLKL(mp->b_cont) < sizeof(struct tun_lx_ifreq)) {
++           tuniocack(wq, mp, M_IOCNAK, 0, EINVAL);
++	   return;
++	}
++	if (str->ppa != NULL) {
++           tuniocack(wq, mp, M_IOCNAK, 0, EBUSY);
++	   return;
++	}
++	req = (struct tun_lx_ifreq *)mp->b_cont->b_rptr;
++	req->name[sizeof(req->name) - 1] = '\0';
++	if (req->flags != (TUNLX_IFF_TUN | TUNLX_IFF_NO_PI)) {
++           tuniocack(wq, mp, M_IOCNAK, 0, EINVAL);
++	   return;
++	}
++	p = tun_lx_requested_ppa(req->name);
++	if ((ppa = tun_alloc_ppa(p)) == NULL) {
++           tuniocack(wq, mp, M_IOCNAK, 0, EBUSY);
++	   return;
++	}
++	ppa->rq = str->rq;
++	str->ppa = ppa;
++	str->flags |= TUN_CONTROL;
++	(void) snprintf(req->name, sizeof(req->name), "tun%d", ppa->id);
++	req->ppa = ppa->id;
++	ppa->lx_zoneid = req->zoneid;
++
++	if ((mopt = allocb(sizeof(struct stroptions), BPRI_LO)) == NULL) {
++	   tun_ppa[ppa->id] = NULL;
++	   str->ppa = NULL;
++	   str->flags &= ~TUN_CONTROL;
++	   kmem_free((char *)ppa, sizeof(struct tunppa));
++           tuniocack(wq, mp, M_IOCNAK, 0, ENOMEM);
++	   return;
++	}
++	mopt->b_datap->db_type = M_SETOPTS;
++	mopt->b_wptr += sizeof(struct stroptions);
++	sop = (struct stroptions *)mopt->b_rptr;
++	sop->so_flags = SO_HIWAT;
++	sop->so_hiwat = TUN_SO_HIWAT;
++	putnext(ppa->rq, mopt);
++	tuniocack_data(wq, mp, 0);
++	break;
++     }
++
++     case TUNLXGETIFF: {
++	struct tun_lx_ifreq *req;
++
++	if (mp->b_cont == NULL ||
++	    MBLKL(mp->b_cont) < sizeof(struct tun_lx_ifreq) ||
++	    str->ppa == NULL || (str->flags & TUN_CONTROL) == 0) {
++           tuniocack(wq, mp, M_IOCNAK, 0, EINVAL);
++	   return;
++	}
++	req = (struct tun_lx_ifreq *)mp->b_cont->b_rptr;
++	bzero(req, sizeof(*req));
++	if (str->ppa->lx_name[0] != '\0')
++	   (void) strlcpy(req->name, str->ppa->lx_name,
++	                  sizeof(req->name));
++	else
++	   (void) snprintf(req->name, sizeof(req->name), "tun%d",
++	                   str->ppa->id);
++	req->flags = TUNLX_IFF_TUN | TUNLX_IFF_NO_PI;
++	req->ppa = str->ppa->id;
++	req->zoneid = str->ppa->lx_zoneid;
++	tuniocack_data(wq, mp, 0);
++	break;
++     }
++#endif
++
+      case DLIOCRAW:          /* Raw M_DATA mode */
+         str->flags |= TUN_RAW;
+         tuniocack(wq, mp, M_IOCACK, 0, 0);
+@@ -1350,6 +1688,11 @@
+ 	break;
+ 
+      case M_IOCTL:
++#ifdef TUNTAP_TUN
++	if (((struct iocblk *)mp->b_rptr)->ioc_cmd == TUNLXPLUMBIFF)
++	   tun_lx_plumb_defer(wq, mp);
++	else
++#endif
+ 	qwriter(wq, mp, tun_ioctl, PERIM_OUTER);
+ 	break;
+ 
